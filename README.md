@@ -2,6 +2,8 @@
 
 A real-time, interactive GUI application for building and tuning image processing pipelines using OpenCV and PyQt6. Load video from various sources (camera, file, RTSP), add processing steps, adjust parameters, visualize intermediate results, and save/load pipeline configurations.
 
+![screenshot](screenshot.png)
+
 ## Features
 
 *   **Multiple Video Sources:** Connect to built-in/USB cameras, local video files (MP4, AVI, etc.), or RTSP network streams.
