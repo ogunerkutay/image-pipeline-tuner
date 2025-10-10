@@ -1324,112 +1324,150 @@ class VideoThread(QThread):
 
     @override
     def run(self) -> None:
-        """Main thread execution method for capturing video frames."""
+        """Main thread execution method for capturing video frames or streaming an image."""
         try:
-            # Initialize VideoCapture
-            # cv2.VideoCapture can return a non-None object even if it fails to open.
-            # The check `isOpened()` is needed.
-            # The type hint for the return of VideoCapture is often just VideoCapture, not Optional[VideoCapture].
-            # The assignment `self.cap = ...` is fine, but the subsequent `is None` check is necessary runtime.
-            # Diagnostic reportUnknownMemberType on VideoCapture stub addressed by ignore
-            self.cap = cv2.VideoCapture(self.video_source) # type: ignore[reportUnknownMemberType]
+            # Check if the video source is a path to an image file
+            is_image_source = isinstance(self.video_source, str) and any(
+                self.video_source.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.bmp', '.tiff']
+            )
 
-            # Check if the source was opened successfully
-            # Runtime can fail and self.cap might be None or an invalid object. Keep the check. Ignore diagnostic.
-            # Diagnostic reportUnknownMemberType on isOpened stub addressed by ignore
-            if self.cap is None or not self.cap.isOpened(): # type: ignore[reportUnnecessaryComparison, reportUnknownMemberType]
-                error_msg = f"Could not open video source: {self.video_source}"
-                # Diagnostic reportUnknownMemberType on emit stub addressed by ignore
-                self.error_signal.emit(error_msg) # type: ignore[reportUnknownMemberType]
-                self._is_running = False # Stop the thread if source fails
-                # Return early as capture failed
-                return
+            if is_image_source:
+                # --- Image Streaming Logic ---
+                print(f"Image source detected: {self.video_source}")
+                # Diagnostic reportUnknownMemberType on imread stub addressed by ignore
+                image_mat: Optional[CvMatLike] = cv2.imread(self.video_source) # type: ignore[reportUnknownMemberType]
 
-            # Attempt to get source properties for FPS and frame count
-            # cap.get() returns float. Add type hint.
-            # Diagnostic reportUnknownMemberType on get stub addressed by ignore
-            fps_cap: float = self.cap.get(cv2.CAP_PROP_FPS) # type: ignore[reportUnknownMemberType]
-            # Diagnostic reportUnknownMemberType on get stub addressed by ignore
-            total_frames_cap: float = self.cap.get(cv2.CAP_PROP_FRAME_COUNT) # type: ignore[reportUnknownMemberType]
+                # Check if image was loaded successfully
+                # Check is needed runtime, ignore diagnostic.
+                if image_mat is None or np.asarray(image_mat).size == 0: # type: ignore[reportUnnecessaryComparison]
+                    error_msg = f"Could not read image file: {self.video_source}"
+                    # Diagnostic reportUnknownMemberType on emit stub addressed by ignore
+                    self.error_signal.emit(error_msg) # type: ignore[reportUnknownMemberType]
+                    return # Stop thread execution
 
-            # Determine if the source is likely a file (check if it's a string path that exists)
-            # Ensure self.video_source is treated as str for the check
-            is_file_source = isinstance(self.video_source, str) and os.path.isfile(self.video_source)
+                # Convert the loaded image to the standard format once
+                try:
+                    frame_to_emit: NDArrayUInt8 = _ensure_uint8_image(image_mat)
+                except Exception as conversion_e:
+                    # Diagnostic reportUnknownMemberType on emit stub addressed by ignore
+                    self.error_signal.emit(f"Image conversion error: {conversion_e}") # type: ignore[reportUnknownMemberType]
+                    return
 
-            # Determine frame delay for playback rate control
-            # Default to 30 FPS if FPS is unknown (0) or non-positive
-            fps: float = fps_cap if fps_cap > 0.0 else 30.0
-            # Calculate delay in milliseconds, ensuring minimum 1ms delay
-            frame_delay_ms: int = max(1, int(1000.0 / fps)) # Use 1000.0 for float division
-
-            print(f"Video source opened: {self.video_source}. FPS: {fps_cap:.2f}, Total Frames: {total_frames_cap:.0f}, Frame Delay (ms): {frame_delay_ms}")
-
-            # Main loop for capturing frames
-            while self._is_running:
-                loop_start_time = time.perf_counter() # Record start time for timing
-
-                # Check if capture object is still valid before read (should be unless unexpected error)
-                # Runtime can fail. Keep check and ignore.
-                if self.cap is None: # type: ignore[reportUnnecessaryComparison] # Check is needed runtime
-                     print("Video capture object became None unexpectedly.")
-                     break # Exit loop if cap is unexpectedly None
-
-                # Read a frame from the capture source
-                # read() returns tuple[bool, CvMatLike | None]. Expecting CvMatLike if ret is True.
-                # Diagnostic reportUnknownMemberType on read stub addressed by ignore
-                ret, frame_mat = self.cap.read() # type: ignore[reportUnknownMemberType]
-
-                # Runtime can return None or an empty Mat even if ret is True in some cases. Keep the check. Ignore diagnostic.
-                # np.asarray handles MatLike -> ndarray conversion robustly.
-                # frame_mat could be None according to stubs. Keep check, ignore diagnostic.
-                if ret:
-                    if frame_mat is not None and np.asarray(frame_mat).size > 0: # type: ignore[reportUnnecessaryComparison]
-                        # Convert the captured frame (CvMatLike) to NDArrayUInt8 consistently
-                        # This handles potential varying return types of cv2.read() and ensures uint8 dtype
-                        try:
-                            # Use the robust conversion helper. _ensure_uint8_image returns NDArrayUInt8.
-                            frame_to_emit: NDArrayUInt8 = _ensure_uint8_image(frame_mat)
-                            # Emit the processed frame signal (as object for PyQt)
-                            # Diagnostic reportUnknownMemberType on emit stub addressed by ignore
-                            self.new_frame_signal.emit(frame_to_emit) # type: ignore[reportUnknownMemberType]
-                        except Exception as conversion_e:
-                            # Handle errors during image conversion before emitting
-                            print(f"Error converting captured frame: {conversion_e}")
-                            # Diagnostic reportUnknownMemberType on emit stub addressed by ignore
-                            self.error_signal.emit(f"Frame conversion error: {conversion_e}") # type: ignore[reportUnknownMemberType]
-                            # For now, we continue the loop even on conversion error, but log/report it.
-                            pass # Continue loop
-                    else:
-                        # ret is True, but frame_mat is None or empty. Log this unexpected state.
-                         print("Warning: cv2.read returned True but frame is None or empty.")
-                         # Diagnostic reportUnknownMemberType on emit stub addressed by ignore
-                         self.error_signal.emit("Received None or empty frame from source") # type: ignore[reportUnknownMemberType]
-
-
-                else: # If ret is False (failed to read frame)
-                    # For files or general streams (string sources), assume end of source or persistent error
-                    # Also include streams that aren't file paths
-                    is_stream_source = isinstance(self.video_source, str) and not os.path.isfile(str(self.video_source)) and not str(self.video_source).isdigit()
-                    if is_file_source or is_stream_source:
-                        err_msg = "Video file/stream ended or read error."
-                        # Diagnostic reportUnknownMemberType on emit stub addressed by ignore
-                        self.error_signal.emit(err_msg) # type: ignore[reportUnknownMemberType]
-                        self._is_running = False
-                        break # Exit loop
-                    else: # For cameras (integer source), keep trying, maybe it's temporary frame drop
-                        # Wait a bit before retrying camera read
-                        # Diagnostic reportUnknownMemberType on msleep stub addressed by ignore
-                        self.msleep(200); continue # type: ignore[reportUnknownMemberType]
-
-
-                # Control frame rate based on calculated delay
-                elapsed_time_ms = (time.perf_counter() - loop_start_time) * 1000
-                sleep_time_ms = frame_delay_ms - elapsed_time_ms
-                if sleep_time_ms > 0:
-                    # Use msleep (milliseconds) from QThread
+                # Loop to continuously emit the same image frame, but only re-emit if a change is triggered
+                # Emit the frame once immediately
+                self.new_frame_signal.emit(frame_to_emit) # type: ignore[reportUnknownMemberType]
+                # Now, wait in a loop without emitting, until the thread is stopped.
+                # This keeps the thread alive but idle, preventing it from finishing,
+                # which would trigger the "Connect Source" button to reset.
+                while self._is_running:
                     # Diagnostic reportUnknownMemberType on msleep stub addressed by ignore
-                    self.msleep(int(sleep_time_ms)) # type: ignore[reportUnknownMemberType]
+                    self.msleep(100) # type: ignore[reportUnknownMemberType]
 
+            else:
+                # --- Video Capture Logic (existing logic) ---
+                # Initialize VideoCapture
+                # cv2.VideoCapture can return a non-None object even if it fails to open.
+                # The check `isOpened()` is needed.
+                # The type hint for the return of VideoCapture is often just VideoCapture, not Optional[VideoCapture].
+                # The assignment `self.cap = ...` is fine, but the subsequent `is None` check is necessary runtime.
+                # Diagnostic reportUnknownMemberType on VideoCapture stub addressed by ignore
+                self.cap = cv2.VideoCapture(self.video_source) # type: ignore[reportUnknownMemberType]
+
+                # Check if the source was opened successfully
+                # Runtime can fail and self.cap might be None or an invalid object. Keep the check. Ignore diagnostic.
+                # Diagnostic reportUnknownMemberType on isOpened stub addressed by ignore
+                if self.cap is None or not self.cap.isOpened(): # type: ignore[reportUnnecessaryComparison, reportUnknownMemberType]
+                    error_msg = f"Could not open video source: {self.video_source}"
+                    # Diagnostic reportUnknownMemberType on emit stub addressed by ignore
+                    self.error_signal.emit(error_msg) # type: ignore[reportUnknownMemberType]
+                    self._is_running = False # Stop the thread if source fails
+                    # Return early as capture failed
+                    return
+
+                # Attempt to get source properties for FPS and frame count
+                # cap.get() returns float. Add type hint.
+                # Diagnostic reportUnknownMemberType on get stub addressed by ignore
+                fps_cap: float = self.cap.get(cv2.CAP_PROP_FPS) # type: ignore[reportUnknownMemberType]
+                # Diagnostic reportUnknownMemberType on get stub addressed by ignore
+                total_frames_cap: float = self.cap.get(cv2.CAP_PROP_FRAME_COUNT) # type: ignore[reportUnknownMemberType]
+
+                # Determine if the source is likely a file (check if it's a string path that exists)
+                # Ensure self.video_source is treated as str for the check
+                is_file_source = isinstance(self.video_source, str) and os.path.isfile(self.video_source)
+
+                # Determine frame delay for playback rate control
+                # Default to 30 FPS if FPS is unknown (0) or non-positive
+                fps: float = fps_cap if fps_cap > 0.0 else 30.0
+                # Calculate delay in milliseconds, ensuring minimum 1ms delay
+                frame_delay_ms: int = max(1, int(1000.0 / fps)) # Use 1000.0 for float division
+
+                print(f"Video source opened: {self.video_source}. FPS: {fps_cap:.2f}, Total Frames: {total_frames_cap:.0f}, Frame Delay (ms): {frame_delay_ms}")
+
+                # Main loop for capturing frames
+                while self._is_running:
+                    loop_start_time = time.perf_counter() # Record start time for timing
+
+                    # Check if capture object is still valid before read (should be unless unexpected error)
+                    # Runtime can fail. Keep check and ignore.
+                    if self.cap is None: # type: ignore[reportUnnecessaryComparison] # Check is needed runtime
+                        print("Video capture object became None unexpectedly.")
+                        break # Exit loop if cap is unexpectedly None
+
+                    # Read a frame from the capture source
+                    # read() returns tuple[bool, CvMatLike | None]. Expecting CvMatLike if ret is True.
+                    # Diagnostic reportUnknownMemberType on read stub addressed by ignore
+                    ret, frame_mat = self.cap.read() # type: ignore[reportUnknownMemberType]
+
+                    # Runtime can return None or an empty Mat even if ret is True in some cases. Keep the check. Ignore diagnostic.
+                    # np.asarray handles MatLike -> ndarray conversion robustly.
+                    # frame_mat could be None according to stubs. Keep check, ignore diagnostic.
+                    if ret:
+                        if frame_mat is not None and np.asarray(frame_mat).size > 0: # type: ignore[reportUnnecessaryComparison]
+                            # Convert the captured frame (CvMatLike) to NDArrayUInt8 consistently
+                            # This handles potential varying return types of cv2.read() and ensures uint8 dtype
+                            try:
+                                # Use the robust conversion helper. _ensure_uint8_image returns NDArrayUInt8.
+                                frame_to_emit: NDArrayUInt8 = _ensure_uint8_image(frame_mat)
+                                # Emit the processed frame signal (as object for PyQt)
+                                # Diagnostic reportUnknownMemberType on emit stub addressed by ignore
+                                self.new_frame_signal.emit(frame_to_emit) # type: ignore[reportUnknownMemberType]
+                            except Exception as conversion_e:
+                                # Handle errors during image conversion before emitting
+                                print(f"Error converting captured frame: {conversion_e}")
+                                # Diagnostic reportUnknownMemberType on emit stub addressed by ignore
+                                self.error_signal.emit(f"Frame conversion error: {conversion_e}") # type: ignore[reportUnknownMemberType]
+                                # For now, we continue the loop even on conversion error, but log/report it.
+                                pass # Continue loop
+                        else:
+                            # ret is True, but frame_mat is None or empty. Log this unexpected state.
+                            print("Warning: cv2.read returned True but frame is None or empty.")
+                            # Diagnostic reportUnknownMemberType on emit stub addressed by ignore
+                            self.error_signal.emit("Received None or empty frame from source") # type: ignore[reportUnknownMemberType]
+
+
+                    else: # If ret is False (failed to read frame)
+                        # For files or general streams (string sources), assume end of source or persistent error
+                        # Also include streams that aren't file paths
+                        is_stream_source = isinstance(self.video_source, str) and not os.path.isfile(str(self.video_source)) and not str(self.video_source).isdigit()
+                        if is_file_source or is_stream_source:
+                            err_msg = "Video file/stream ended or read error."
+                            # Diagnostic reportUnknownMemberType on emit stub addressed by ignore
+                            self.error_signal.emit(err_msg) # type: ignore[reportUnknownMemberType]
+                            self._is_running = False
+                            break # Exit loop
+                        else: # For cameras (integer source), keep trying, maybe it's temporary frame drop
+                            # Wait a bit before retrying camera read
+                            # Diagnostic reportUnknownMemberType on msleep stub addressed by ignore
+                            self.msleep(200); continue # type: ignore[reportUnknownMemberType]
+
+
+                    # Control frame rate based on calculated delay
+                    elapsed_time_ms = (time.perf_counter() - loop_start_time) * 1000
+                    sleep_time_ms = frame_delay_ms - elapsed_time_ms
+                    if sleep_time_ms > 0:
+                        # Use msleep (milliseconds) from QThread
+                        # Diagnostic reportUnknownMemberType on msleep stub addressed by ignore
+                        self.msleep(int(sleep_time_ms)) # type: ignore[reportUnknownMemberType]
 
         except Exception as e:
             # Catch any other unexpected exceptions in the thread
@@ -1716,7 +1754,7 @@ class ProcessingPipelineApp(QMainWindow):
         source_groupbox = QGroupBox("Video Source"); source_layout = QGridLayout(source_groupbox) # Set layout directly on groupbox
         self.source_type_combo = QComboBox()
         # Standard PyQt method. Add ignore.
-        self.source_type_combo.addItems(["Camera ID", "Video File", "RTSP Stream"]) # type: ignore[reportUnknownMemberType]
+        self.source_type_combo.addItems(["Camera ID", "Video File", "Image File", "RTSP Stream"]) # type: ignore[reportUnknownMemberType]
         # Standard connection. Add ignore.
         self._connections.append(self.source_type_combo.currentIndexChanged.connect(self.update_source_input_visibility)) # type: ignore[reportUnknownMemberType]
 
@@ -1736,6 +1774,11 @@ class ProcessingPipelineApp(QMainWindow):
         # Standard connection. Add ignore.
         self._connections.append(self.browse_video_button.clicked.connect(self.browse_for_video_file)) # type: ignore[reportUnknownMemberType]
 
+        # Image File input
+        self.image_file_edit = QLineEdit(); self.image_file_edit.setPlaceholderText("Path to image file")
+        self.browse_image_button = QPushButton("Browse...")
+        self._connections.append(self.browse_image_button.clicked.connect(self.browse_for_image_file))
+
         # RTSP URL input
         self.rtsp_url_edit = QLineEdit(); self.rtsp_url_edit.setPlaceholderText("rtsp://user:pass@ip:port/...") # setPlaceholderText stub
 
@@ -1744,6 +1787,9 @@ class ProcessingPipelineApp(QMainWindow):
         source_layout.addWidget(self.camera_id_spinbox, 1, 1, 1, 2) # Span 2 columns
         source_layout.addWidget(self.video_file_edit, 1, 1)
         source_layout.addWidget(self.browse_video_button, 1, 2)
+        source_layout.addWidget(self.image_file_edit, 1, 1)
+        source_layout.addWidget(self.browse_image_button, 1, 2)
+        self.rtsp_url_edit = QLineEdit(); self.rtsp_url_edit.setPlaceholderText("rtsp://user:pass@ip:port/...")
         source_layout.addWidget(self.rtsp_url_edit, 1, 1, 1, 2) # Span 2 columns
 
         # Set initial value for file/rtsp if applicable
@@ -1930,15 +1976,20 @@ class ProcessingPipelineApp(QMainWindow):
         # Set visibility for each set of widgets based on the selected source type string.
         # Use string comparison directly.
         is_camera = source_type == "Camera ID"
-        is_file = source_type == "Video File"
+        is_video_file = source_type == "Video File"
+        is_image_file = source_type == "Image File"
         is_rtsp = source_type == "RTSP Stream"
 
         # Diagnostic reportUnknownMemberType on setVisible stub addressed by ignore
         self.camera_id_spinbox.setVisible(is_camera) # type: ignore[reportUnknownMemberType]
         # Diagnostic reportUnknownMemberType on setVisible stub addressed by ignore
-        self.video_file_edit.setVisible(is_file) # type: ignore[reportUnknownMemberType]
+        self.video_file_edit.setVisible(is_video_file) # type: ignore[reportUnknownMemberType]
         # Diagnostic reportUnknownMemberType on setVisible stub addressed by ignore
-        self.browse_video_button.setVisible(is_file) # type: ignore[reportUnknownMemberType]
+        self.browse_video_button.setVisible(is_video_file) # type: ignore[reportUnknownMemberType]
+        # Diagnostic reportUnknownMemberType on setVisible stub addressed by ignore
+        self.image_file_edit.setVisible(is_image_file)
+        # Diagnostic reportUnknownMemberType on setVisible stub addressed by ignore
+        self.browse_image_button.setVisible(is_image_file)
         # Diagnostic reportUnknownMemberType on setVisible stub addressed by ignore
         self.rtsp_url_edit.setVisible(is_rtsp) # type: ignore[reportUnknownMemberType]
 
@@ -1952,6 +2003,13 @@ class ProcessingPipelineApp(QMainWindow):
         if filePath:
             # Diagnostic reportUnknownMemberType on setText stub addressed by ignore
             self.video_file_edit.setText(filePath) # type: ignore[reportUnknownMemberType]
+
+    def browse_for_image_file(self) -> None:
+        """Opens a file dialog for the user to select an image file."""
+        # QFileDialog.getOpenFileName returns a tuple: (filePath: str, filter: str)
+        filePath, _ = QFileDialog.getOpenFileName(self, "Select Image File", "", "Image Files (*.png *.jpg *.jpeg *.bmp *.tiff);;All Files (*)")
+        if filePath:
+            self.image_file_edit.setText(filePath)
 
     def connect_source_slot(self) -> None:
         """Slot to handle Connect/Stop Stream button click."""
@@ -2009,6 +2067,10 @@ class ProcessingPipelineApp(QMainWindow):
             if not current_video_source_ui or not os.path.exists(current_video_source_ui):
                 # Diagnostic reportUnknownMemberType on warning stub addressed by ignore
                 QMessageBox.warning(self, "Source Error", "Video file path is invalid or file does not exist."); return # type: ignore[reportUnknownMemberType]
+        elif source_type == "Image File":
+            current_video_source_ui = self.image_file_edit.text()
+            if not current_video_source_ui or not os.path.exists(current_video_source_ui):
+                QMessageBox.warning(self, "Source Error", "Image file path is invalid or file does not exist."); return
         elif source_type == "RTSP Stream":
             # Diagnostic reportUnknownMemberType on text stub addressed by ignore
             current_video_source_ui = self.rtsp_url_edit.text() # QLineEdit.text() returns str # type: ignore[reportUnknownMemberType]
